@@ -1,0 +1,31 @@
+%!PS
+/pinst 500 array def
+/pop_ucache 100 array def
+systemdict /ucache get pop_ucache exch 0 exch put
+systemdict /pop get pop_ucache exch 1 exch put
+pinst 1 pop_ucache put
+/impl 100 dict def
+impl /Implementation [pinst] put
+
+% Scan with integers: if zpop modifies VALUE, integer decreases by 16
+2 1 250 {
+  /pos exch def
+  pinst pos 100000 put
+  { impl setpattern } stopped { pop } if
+  {
+    pinst pos get dup type /integertype eq {
+      100000 ne { (VALUE HIT pos=) print pos 10 string cvs print
+        ( val=) print pinst pos get 10 string cvs print (\n) print flush
+      } if
+    } {
+      (TAS HIT pos=) print pos 10 string cvs print
+      ( type=) print type 20 string cvs print (\n) print flush
+    } ifelse
+  } stopped { pop
+    (CRASH-HIT pos=) print pos 10 string cvs print (\n) print flush
+  } if
+  pinst pos null put
+  { [/DeviceGray] setcolorspace } stopped { pop } if
+} for
+(Done.\n) print flush
+quit
