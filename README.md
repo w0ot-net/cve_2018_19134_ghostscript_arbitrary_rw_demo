@@ -12,7 +12,9 @@ Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9
 
 A master/slave upgrade then turns this ~32KB window into full address-arbitrary r/w: a slave string's ref struct within the window is repointed on each call by overwriting its `value.bytes` field through the master, and re-fetched via a `getinterval` sub-array that shares the underlying storage. This produces `read_bytes(addr, len)` and `write_bytes(addr, bytes)` matching the library's `rw_init` contract. A leaked code pointer (`zput` address from arr[0]'s ref struct) is provided as `code_ptr`.
 
-**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call, providing ref-level read/write across object boundaries. VALUE mode does not produce address-arbitrary byte-level access and cannot integrate with the library.
+**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call, providing ref-level read/write across object boundaries.
+
+VALUE mode cannot produce address-arbitrary byte-level access: PostScript's array `put` writes full 16-byte typed refs, so there is no way to independently rewrite a string ref's 8-byte `value.bytes` pointer — the master/slave upgrade that TAS mode uses is structurally impossible at ref granularity. Similarly, array `get` on a string ref returns its content, not its raw backing pointer, so address discovery via self-reference (as TAS mode does) is also unavailable. VALUE mode therefore cannot integrate with the library.
 
 ## Setup
 
@@ -49,10 +51,10 @@ When `library.ps` is loaded first, the exploit auto-detects the library and call
 | Version | Mode | op_stack.p offset | Library |
 |---------|------|-------------------|---------|
 | 8.63 | — | — | setpattern path does not reach vulnerable code |
-| 8.64 | VALUE | pinst[31] (504) | no (ref-level only) |
-| 8.71 | VALUE | pinst[31] (504) | no (ref-level only) |
-| 9.01 | VALUE | pinst[38] (616) | no (32-bit integers) |
-| 9.06 | VALUE | pinst[38] (616) | no (ref-level only) |
+| 8.64 | VALUE | pinst[31] (504) | no — ref-level `put` cannot repoint a string's backing pointer |
+| 8.71 | VALUE | pinst[31] (504) | no — same structural limitation |
+| 9.01 | VALUE | pinst[38] (616) | no — 32-bit integers |
+| 9.06 | VALUE | pinst[38] (616) | no — same structural limitation |
 | 9.10 | TAS | pinst[39] (624) | **rw_init OK** |
 | 9.14 | TAS | pinst[39] (624) | **rw_init OK** |
 | 9.18 | TAS | pinst[39] (624) | **rw_init OK** |
