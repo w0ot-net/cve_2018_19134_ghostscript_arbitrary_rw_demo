@@ -1,0 +1,5 @@
+# Path to the ghostscript_version_graveyard gs-run wrapper
+GS_RUN=/dev/shm/ghostscript_version_graveyard/gs-run
+
+# Ghostscript version vulnerable to CVE-2018-19134 (fixed in 9.26)
+GS_VERSION=9.18
