@@ -36,9 +36,15 @@ cp gs.conf.example gs.conf
 |---------|------|-------------------|--------|
 | 8.63 | — | — | setpattern path does not reach vulnerable code |
 | 8.64 | VALUE | pinst[31] (504) | arbitrary ref-level r/w |
+| 8.71 | VALUE | pinst[31] (504) | arbitrary ref-level r/w |
 | 9.01 | VALUE | pinst[38] (616) | arbitrary ref-level r/w |
+| 9.06 | VALUE | pinst[38] (616) | arbitrary ref-level r/w |
+| 9.10 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
 | 9.14 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
 | 9.18 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
+| 9.20 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
+| 9.22 | TAS | pinst[39] (624) | arbitrary byte-level r/w |
+| 9.26 | — | — | patched |
 
 The exploit auto-detects the correct offset and mode at runtime.
 
