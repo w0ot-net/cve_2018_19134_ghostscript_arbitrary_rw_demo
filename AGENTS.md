@@ -3,3 +3,4 @@
 - stage files by exact name — never use `git add -A` or `git add .`
 - every function must typecheck its input arguments and `stop` on mismatch
 - never use `/proc/self/mem` or other procfs tricks — all primitives must come from the exploit technique itself
+- do not support interpreters without 64-bit PostScript integers; document them as out of scope and fail fast

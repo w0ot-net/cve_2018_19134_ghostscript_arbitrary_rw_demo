@@ -12,13 +12,15 @@ Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9
 
 A master/slave upgrade then turns this ~32KB window into full address-arbitrary r/w: a slave string's ref struct within the window is repointed on each call by overwriting its `value.bytes` field through the master, and re-fetched via a `getinterval` sub-array that shares the underlying storage. This produces `read_bytes(addr, len)` and `write_bytes(addr, bytes)` matching the library's `rw_init` contract. A leaked code pointer (`zput` address from arr[0]'s ref struct) is provided as `code_ptr`.
 
-**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call. The exploit allocates an early master string, walks the shifted array until typed ref writes overlap the string's backing bytes, then uses that byte-level overlap to synthesize and repoint a slave string ref. On builds with 64-bit PostScript integers, this upgrades VALUE mode to the same `read_bytes(addr, len)` and `write_bytes(addr, bytes)` API contract as TAS mode.
+**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call. The exploit allocates an early master string, walks the shifted array until typed ref writes overlap the string's backing bytes, then uses that byte-level overlap to synthesize and repoint a slave string ref. This upgrades VALUE mode to the same `read_bytes(addr, len)` and `write_bytes(addr, bytes)` API contract as TAS mode.
 
 The VALUE upgrade leaves a synthetic one-element array view live for the byte-level slave ref. That is enough for `rw_init` and the `mem_*` API while the interpreter is running, but these old VALUE-era builds may still segfault during interpreter teardown after successful initialization.
 
 ## Setup
 
-Requires a Ghostscript version vulnerable to CVE-2018-19134 (fixed in 9.26). We use [ghostscript_version_graveyard](https://github.com/w0ot-net/ghostscript_version_graveyard) to run old Ghostscript versions via Docker.
+Requires a Ghostscript version vulnerable to CVE-2018-19134 (fixed in 9.26) with 64-bit PostScript integers. Interpreters without 64-bit integer support are explicitly out of scope because the r/w API passes absolute addresses as integer values.
+
+We use [ghostscript_version_graveyard](https://github.com/w0ot-net/ghostscript_version_graveyard) to run old Ghostscript versions via Docker.
 
 Copy the example config and adjust paths if needed:
 
@@ -52,9 +54,9 @@ When `library.ps` is loaded first, the exploit auto-detects the library and call
 |---------|------|-------------------|---------|
 | 8.63 | — | — | setpattern path does not reach vulnerable code |
 | 8.64 | VALUE | pinst[31] (504) | **rw_init OK**; teardown may SIGSEGV |
-| 8.71 | VALUE | pinst[31] (504) | no — local graveyard build uses 32-bit integers |
-| 9.01 | VALUE | pinst[38] (616) | no — 32-bit integers |
-| 9.06 | VALUE | pinst[38] (616) | no — local graveyard build uses 32-bit integers |
+| 8.71 | VALUE | pinst[31] (504) | unsupported — 32-bit integers |
+| 9.01 | VALUE | pinst[38] (616) | unsupported — 32-bit integers |
+| 9.06 | VALUE | pinst[38] (616) | unsupported — 32-bit integers |
 | 9.10 | TAS | pinst[39] (624) | **rw_init OK** |
 | 9.14 | TAS | pinst[39] (624) | **rw_init OK** |
 | 9.18 | TAS | pinst[39] (624) | **rw_init OK** |
