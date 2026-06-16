@@ -1,6 +1,6 @@
 # cve-2018-19134_ghostscript_arbitrary_rw_demo
 
-Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9.26) to produce address-arbitrary read/write matching the [ghostscript_exploitation_library](https://github.com/w0ot-net/ghostscript_exploitation_library) API contract.
+Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9.26) to produce the APIv2 slave-window contract consumed by [ghostscript_exploitation_library](https://github.com/w0ot-net/ghostscript_exploitation_library).
 
 ## How it works
 
@@ -10,9 +10,9 @@ Exploits a type confusion in `zsetcolor` (CVE-2018-19134, fixed in Ghostscript 9
 
 **TAS mode** (GS 9.08–9.25): `osp` overlaps a ref's `type_attrs` field. Repeated `setpattern` calls subtract 16 from `type_attrs` until it wraps from `t_array` (4) to `t_string` (18), converting the array into a string whose `value.bytes` pointer still addresses the original ref storage — exposing it as raw bytes for direct byte-level read/write.
 
-A master/slave upgrade then turns this ~32KB window into full address-arbitrary r/w: a slave string's ref struct within the window is repointed on each call by overwriting its `value.bytes` field through the master, and re-fetched via a `getinterval` sub-array that shares the underlying storage. This produces `read_bytes(addr, len)` and `write_bytes(addr, bytes)` matching the library's `rw_init` contract. A leaked code pointer (`zput` address from arr[0]'s ref struct) is provided as `code_ptr`.
+A master/slave upgrade then exposes a live slave string ref through this ~32KB window. The exploit publishes the five APIv2 `rw_init` fields: `master_string`, `slave_holder`, `slave_index`, `slave_ref_window_offset`, and `slave_data_ptr_offset`. The library owns the final address-arbitrary r/w wrappers and derives its own image pointer from a temporary operator ref; the exploit no longer provides `read_bytes`, `write_bytes`, or a code pointer.
 
-**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call. The exploit allocates an early master string, walks the shifted array until typed ref writes overlap the string's backing bytes, then uses that byte-level overlap to synthesize and repoint a slave string ref. This upgrades VALUE mode to the same `read_bytes(addr, len)` and `write_bytes(addr, bytes)` API contract as TAS mode.
+**VALUE mode** (GS 8.64–9.07): `osp` overlaps a ref's `value` field (the element pointer). Each `setpattern` call shifts the array's view backward over heap memory by `sizeof(ref)` per `zpop` call. The exploit allocates an early master string, walks the shifted array until typed ref writes overlap the string's backing bytes, then uses that byte-level overlap to synthesize and repoint a slave string ref. This upgrades VALUE mode to the same APIv2 slave-window contract as TAS mode.
 
 The VALUE upgrade leaves a synthetic one-element array view live for the byte-level slave ref. That is enough for `rw_init` and the `mem_*` API while the interpreter is running, but these old VALUE-era builds may still segfault during interpreter teardown after successful initialization.
 
@@ -32,21 +32,21 @@ cp gs.conf.example gs.conf
 
 ## Running
 
-Standalone (demo output):
+Default run with the bundled APIv2 library:
 
 ```bash
 ./run.sh
 ```
 
-With the exploitation library (registers `rw_init`, enables `mem_*` / ELF / `gs_exec`):
+Equivalent explicit invocation:
 
 ```bash
 source gs.conf
 $GS_RUN $GS_VERSION -- -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
-    /path/to/library.ps /work/exploit.ps
+    /work/library_v2.ps /work/exploit.ps
 ```
 
-When `library.ps` is loaded first, the exploit auto-detects the library and calls `rw_init` with `read_bytes`, `write_bytes`, `code_ptr`, and `scratch`. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
+When `library_v2.ps` is loaded first, the exploit auto-detects `rw_init` and registers the five-field APIv2 slave-window dictionary. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
 
 ## Tested versions
 
@@ -71,11 +71,10 @@ The exploit auto-detects the correct offset and mode at runtime.
 ```
 CVE-2018-19134 type confusion succeeded after 1288 iterations.
 Mode: TAS at pinst[39]  (byte offset 624)
-code_ptr: 0x00007A11A5BF20C0
 mem_base: 0x000000001BE962C8
-read_bytes / write_bytes registered (address-arbitrary r/w).
+APIv2 slave window prepared.
 
-[+] rw_init succeeded -- library seam active.
+[+] rw_init succeeded -- APIv2 seam active.
 ```
 
 ## Example output (GS 9.18, TAS mode standalone)
@@ -83,12 +82,11 @@ read_bytes / write_bytes registered (address-arbitrary r/w).
 ```
 CVE-2018-19134 type confusion succeeded after 1288 iterations.
 Mode: TAS at pinst[39]  (byte offset 624)
-code_ptr: 0x000076ABE587D0C0
 mem_base: 0x000000003289D058
-read_bytes / write_bytes registered (address-arbitrary r/w).
+APIv2 slave window prepared.
 
-[*] library not loaded; read_bytes / write_bytes available for manual use.
-[*] To activate the full exploitation chain, load library.ps before this file.
+[*] library_v2.ps not loaded; APIv2 slave-window globals are available.
+[*] To activate the full exploitation chain, load library_v2.ps before this file.
 ```
 
 ## Example output (GS 8.64, VALUE mode with library)
@@ -99,11 +97,10 @@ Mode: VALUE at pinst[31]  (byte offset 504)
 Shift rate: 3 refs (48 bytes) per setpattern call
 
 VALUE overlap: value_master[59792] after 13701 shifts.
-code_ptr: 0x00007FBE2EBD1A20
 mem_base: 0x0000000020A66D78
-read_bytes / write_bytes registered (address-arbitrary r/w).
+APIv2 slave window prepared.
 
-[+] rw_init succeeded -- library seam active.
+[+] rw_init succeeded -- APIv2 seam active.
 ```
 
 ## Acknowledgments

