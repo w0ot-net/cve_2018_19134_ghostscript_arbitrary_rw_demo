@@ -20,4 +20,4 @@ fi
 cd "$SCRIPT_DIR"
 exec "$GS_RUN" "$GS_VERSION" -- \
     -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
-    /work/library_v2.ps /work/exploit.ps
+    /work/exploit_monolithic.ps

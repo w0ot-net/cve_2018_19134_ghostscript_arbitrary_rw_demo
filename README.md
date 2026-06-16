@@ -32,7 +32,7 @@ cp gs.conf.example gs.conf
 
 ## Running
 
-Default run with the bundled APIv2 library:
+Default run with the monolithic bundled exploit:
 
 ```bash
 ./run.sh
@@ -43,10 +43,12 @@ Equivalent explicit invocation:
 ```bash
 source gs.conf
 $GS_RUN $GS_VERSION -- -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
-    /work/library_v2.ps /work/exploit.ps
+    /work/exploit_monolithic.ps
 ```
 
-When `library_v2.ps` is loaded first, the exploit auto-detects `rw_init` and registers the five-field APIv2 slave-window dictionary. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
+`exploit_monolithic.ps` contains the APIv2 library followed by the CVE-2018-19134 adapter. The split development form remains available as `/work/library_v2.ps /work/exploit.ps`.
+
+When the APIv2 library is loaded first, the exploit auto-detects `rw_init` and registers the five-field APIv2 slave-window dictionary. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
 
 ## Tested versions
 
