@@ -50,6 +50,19 @@ $GS_RUN $GS_VERSION -- -dNOSAFER -dBATCH -dNOPAUSE -dNODISPLAY -dQUIET \
 
 The split development form remains available as `/work/library_v2.ps /work/exploit.ps /work/exec_tail.ps`.
 
+### Running under an arbitrary output device
+
+The `rw_init` seam and `gs_exec` are independent of the selected page device, so the exploit succeeds under any device Ghostscript can actually open. With no arguments `run.sh` keeps the headless `-dNODISPLAY` default; any extra arguments are forwarded verbatim to Ghostscript so you can pick a device:
+
+```bash
+./run.sh -sDEVICE=png16m -r300
+./run.sh -sDEVICE=pdfwrite
+```
+
+When a `-sDEVICE=` is given without an output file, `run.sh` supplies `-sOutputFile=/dev/null` so output-only devices (pdfwrite, ps2write, txtwrite, ...) can open instead of aborting at startup. The exploit never emits a page, so the sink stays empty.
+
+A device sweep over every device compiled into each build confirms both `rw_init` and the `gs_exec_ok` marker succeed for all of them on every supported version (8.64, 9.10, 9.14, 9.18, 9.20, 9.22). Out of scope: devices that need a real display (x11, display) or an external server/driver (ijs, opvp), and devices simply not compiled into a given build (reported by Ghostscript as `Unknown device`).
+
 ## Tested versions
 
 | Version | Mode | op_stack.p offset | Library |
