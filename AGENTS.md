@@ -4,3 +4,4 @@
 - every function must typecheck its input arguments and `stop` on mismatch
 - never use `/proc/self/mem` or other procfs tricks — all primitives must come from the exploit technique itself
 - do not support interpreters without 64-bit PostScript integers; document them as out of scope and fail fast
+- display-requiring devices (e.g. x11, display) are out of scope; `-sDEVICE=` flags that need a legitimate display may be skipped
